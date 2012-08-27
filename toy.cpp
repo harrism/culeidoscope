@@ -758,26 +758,32 @@ Value *IfExprAST::Codegen() {
   return PN;
 }
 
+// MJH Note: the semantics of for loops are changed here relative to the 
+// original Kaleidoscope example because in the original, for loops ran
+// for one extra iteration compared to loops in other languages like C. See
+// [LLVM bug 13266][1]
+//
+// [1]: http://llvm.org/bugs/show_bug.cgi?id=13266
 Value *ForExprAST::Codegen() {
   // Output this as:
   //   var = alloca double
   //   ...
   //   start = startexpr
   //   store start -> var
-  //   goto loop
-  // loop: 
+  //   br loopstart
+  // loopstart: 
+  //   endcond = endexpr
+  //   br endcond, loopbody, loopexit
+  // loopbody:
   //   ...
   //   bodyexpr
   //   ...
-  // loopend:
   //   step = stepexpr
-  //   endcond = endexpr
-  //
   //   curvar = load var
   //   nextvar = curvar + step
   //   store nextvar -> var
-  //   br endcond, loop, endloop
-  // outloop:
+  //   br loopstart
+  // loopexit:
   
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
 
@@ -793,19 +799,38 @@ Value *ForExprAST::Codegen() {
   
   // Make the new basic block for the loop header, inserting after current
   // block.
-  BasicBlock *LoopBB = BasicBlock::Create(getGlobalContext(), "loop", TheFunction);
+  BasicBlock *LoopStartBB = BasicBlock::Create(getGlobalContext(), "loopstart", TheFunction);
   
   // Insert an explicit fall through from the current block to the LoopBB.
-  Builder.CreateBr(LoopBB);
+  Builder.CreateBr(LoopStartBB);
 
   // Start insertion in LoopBB.
-  Builder.SetInsertPoint(LoopBB);
+  Builder.SetInsertPoint(LoopStartBB);
   
   // Within the loop, the variable is defined equal to the PHI node.  If it
   // shadows an existing variable, we have to restore it, so save it now.
   AllocaInst *OldVal = NamedValues[VarName];
   NamedValues[VarName] = Alloca;
+
+  // Compute the end condition.
+  Value *EndCond = End->Codegen();
+  if (EndCond == 0) return EndCond;
   
+  // Convert condition to a bool by comparing equal to 0.0.
+  EndCond = Builder.CreateFCmpONE(EndCond, 
+                                  ConstantFP::get(getGlobalContext(), APFloat(0.0)),
+                                  "loopcond");
+  
+  // Create the "loop body" and "loop exit" blocks.
+  BasicBlock *LoopBodyBB = BasicBlock::Create(getGlobalContext(), "loopbody", TheFunction);
+  BasicBlock *LoopExitBB = BasicBlock::Create(getGlobalContext(), "loopexit", TheFunction);
+
+  // Insert the conditional branch into the end of LoopEndBB.
+  Builder.CreateCondBr(EndCond, LoopBodyBB, LoopExitBB);
+
+  // Set insertion point to the loop body block
+  Builder.SetInsertPoint(LoopBodyBB);
+ 
   // Emit the body of the loop.  This, like any other expr, can change the
   // current BB.  Note that we ignore the value computed by the body, but don't
   // allow an error.
@@ -822,37 +847,24 @@ Value *ForExprAST::Codegen() {
     StepVal = ConstantFP::get(getGlobalContext(), APFloat(1.0));
   }
   
-  // Compute the end condition.
-  Value *EndCond = End->Codegen();
-  if (EndCond == 0) return EndCond;
-  
   // Reload, increment, and restore the alloca.  This handles the case where
   // the body of the loop mutates the variable.
   Value *CurVar = Builder.CreateLoad(Alloca, VarName.c_str());
   Value *NextVar = Builder.CreateFAdd(CurVar, StepVal, "nextvar");
   Builder.CreateStore(NextVar, Alloca);
   
-  // Convert condition to a bool by comparing equal to 0.0.
-  EndCond = Builder.CreateFCmpONE(EndCond, 
-                              ConstantFP::get(getGlobalContext(), APFloat(0.0)),
-                                  "loopcond");
+  // Create a branch back to the start of the loop
+  Builder.CreateBr(LoopStartBB);
   
-  // Create the "after loop" block and insert it.
-  BasicBlock *AfterBB = BasicBlock::Create(getGlobalContext(), "afterloop", TheFunction);
-  
-  // Insert the conditional branch into the end of LoopEndBB.
-  Builder.CreateCondBr(EndCond, LoopBB, AfterBB);
-  
-  // Any new code will be inserted in AfterBB.
-  Builder.SetInsertPoint(AfterBB);
+  // Any new code will be inserted in "loopexit" block.
+  Builder.SetInsertPoint(LoopExitBB);
   
   // Restore the unshadowed variable.
   if (OldVal)
     NamedValues[VarName] = OldVal;
   else
     NamedValues.erase(VarName);
-
-  
+    
   // for expr always returns 0.0.
   return Constant::getNullValue(Type::getDoubleTy(getGlobalContext()));
 }
@@ -1064,6 +1076,9 @@ static void MainLoop() {
 
 /// putchard - putchar that takes a double and returns 0.
 extern "C" 
+#ifdef WIN32
+__declspec(dllexport)
+#endif
 double putchard(double X) {
   putchar((char)X);
   return 0;
@@ -1071,6 +1086,9 @@ double putchard(double X) {
 
 /// printd - printf that takes a double prints it as "%f\n", returning 0.
 extern "C" 
+#ifdef WIN32
+__declspec(dllexport)
+#endif
 double printd(double X) {
   printf("%f\n", X);
   return 0;
