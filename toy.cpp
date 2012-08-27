@@ -42,6 +42,8 @@ enum Token {
   tok_var = -13
 };
 
+static FILE *Infile = stdin;       // where to read input
+
 static std::string IdentifierStr;  // Filled in if tok_identifier
 static double NumVal;              // Filled in if tok_number
 
@@ -51,11 +53,11 @@ static int gettok() {
 
   // Skip any whitespace.
   while (isspace(LastChar))
-    LastChar = getchar();
+    LastChar = fgetc(Infile);
 
   if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
     IdentifierStr = LastChar;
-    while (isalnum((LastChar = getchar())))
+    while (isalnum((LastChar = fgetc(Infile))))
       IdentifierStr += LastChar;
 
     if (IdentifierStr == "def") return tok_def;
@@ -75,7 +77,7 @@ static int gettok() {
     std::string NumStr;
     do {
       NumStr += LastChar;
-      LastChar = getchar();
+      LastChar = fgetc(Infile);
     } while (isdigit(LastChar) || LastChar == '.');
 
     NumVal = strtod(NumStr.c_str(), 0);
@@ -84,7 +86,7 @@ static int gettok() {
 
   if (LastChar == '#') {
     // Comment until end of line.
-    do LastChar = getchar();
+    do LastChar = fgetc(Infile);
     while (LastChar != EOF && LastChar != '\n' && LastChar != '\r');
     
     if (LastChar != EOF)
@@ -97,7 +99,7 @@ static int gettok() {
 
   // Otherwise, just return the character as its ascii value.
   int ThisChar = LastChar;
-  LastChar = getchar();
+  LastChar = fgetc(Infile);
   return ThisChar;
 }
 
@@ -763,7 +765,7 @@ Value *IfExprAST::Codegen() {
 // for one extra iteration compared to loops in other languages like C. See
 // [LLVM bug 13266][1]
 //
-// [1]: http://llvm.org/bugs/show_bug.cgi?id=13266
+// [1]: 
 Value *ForExprAST::Codegen() {
   // Output this as:
   //   var = alloca double
@@ -1098,7 +1100,11 @@ double printd(double X) {
 // Main driver code.
 //===----------------------------------------------------------------------===//
 
-int main() {
+int main(int argc, char** argv) {
+
+  if (argc > 1)
+    Infile = fopen(argv[1], "r");
+
   InitializeNativeTarget();
   LLVMContext &Context = getGlobalContext();
 
