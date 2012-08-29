@@ -39,13 +39,41 @@ enum Token {
   tok_binary = -11, tok_unary = -12,
   
   // var definition
-  tok_var = -13
+  tok_var = -13,
+
+  // vector type
+  tok_vector = -14
 };
+
+// Types
+static StructType* DVecType = NULL;
+static PointerType* DVecPtrType = NULL;
+static Type* DoubleType = NULL;
+
+struct DVector {
+  double  *ptr;      
+  int     length;
+};
+
+static Module *TheModule;
+static IRBuilder<> Builder(getGlobalContext());
+static std::map<std::string, AllocaInst*> NamedValues;
+static FunctionPassManager *TheFPM;
 
 static FILE *Infile = stdin;       // where to read input
 
 static std::string IdentifierStr;  // Filled in if tok_identifier
 static double NumVal;              // Filled in if tok_number
+
+class ExprAST;
+class PrototypeAST;
+class FunctionAST;
+
+/// Error* - These are little helper functions for error handling.
+ExprAST *Error(const char *Str) { fprintf(stderr, "Error: %s\n", Str); return 0;}
+PrototypeAST *ErrorP(const char *Str) { Error(Str); return 0; }
+FunctionAST *ErrorF(const char *Str) { Error(Str); return 0; }
+Type *ErrorT(const char *Str) { Error(Str); return 0; }
 
 /// gettok - Return the next token from standard input.
 static int gettok() {
@@ -70,6 +98,7 @@ static int gettok() {
     if (IdentifierStr == "binary") return tok_binary;
     if (IdentifierStr == "unary") return tok_unary;
     if (IdentifierStr == "var") return tok_var;
+    if (IdentifierStr == "vector") return tok_vector;
     return tok_identifier;
   }
 
@@ -112,6 +141,7 @@ class ExprAST {
 public:
   virtual ~ExprAST() {}
   virtual Value *Codegen() = 0;
+  virtual Type *getType() const { return DoubleType; }
 };
 
 /// NumberExprAST - Expression class for numeric literals like "1.0".
@@ -124,11 +154,24 @@ public:
 
 /// VariableExprAST - Expression class for referencing a variable, like "a".
 class VariableExprAST : public ExprAST {
+protected:
   std::string Name;
 public:
   VariableExprAST(const std::string &name) : Name(name) {}
   const std::string &getName() const { return Name; }
   virtual Value *Codegen();
+  virtual bool isVector() const { return false; }
+};
+
+class VectorVariableExprAST : public VariableExprAST {
+  ExprAST *Length;
+public:
+  VectorVariableExprAST(const std::string &name, ExprAST *length) 
+    : VariableExprAST(name), Length(length) {}
+  ExprAST *getLength() const { return Length; }
+  virtual Value *Codegen();
+  virtual bool isVector() const { return true; }
+  virtual Type *getType() const { return DVecType; }
 };
 
 /// UnaryExprAST - Expression class for a unary operator.
@@ -139,6 +182,7 @@ public:
   UnaryExprAST(char opcode, ExprAST *operand) 
     : Opcode(opcode), Operand(operand) {}
   virtual Value *Codegen();
+  virtual Type *getType() const { return Operand->getType(); }
 };
 
 /// BinaryExprAST - Expression class for a binary operator.
@@ -149,6 +193,10 @@ public:
   BinaryExprAST(char op, ExprAST *lhs, ExprAST *rhs) 
     : Op(op), LHS(lhs), RHS(rhs) {}
   virtual Value *Codegen();
+  virtual Type *getType() const { 
+    assert(LHS->getType() == RHS->getType());
+    return LHS->getType(); 
+  }
 };
 
 /// CallExprAST - Expression class for function calls.
@@ -159,6 +207,22 @@ public:
   CallExprAST(const std::string &callee, std::vector<ExprAST*> &args)
     : Callee(callee), Args(args) {}
   virtual Value *Codegen();
+  virtual Type *getType() const {
+    Function *CalleeF = TheModule->getFunction(Callee);
+    assert(CalleeF != 0);
+    return CalleeF->getReturnType();
+  }
+};
+
+/// MapExprAST - Expression class for map.
+class MapExprAST : public ExprAST {
+  std::string Callee;
+  std::vector<ExprAST*> Args;
+public:
+  MapExprAST(const std::string &callee, std::vector<ExprAST*> &args)
+    : Callee(callee), Args(args) {}
+  virtual Value *Codegen();
+  virtual Type *getType() const { return DVecType; }
 };
 
 /// IfExprAST - Expression class for if/then/else.
@@ -168,6 +232,10 @@ public:
   IfExprAST(ExprAST *cond, ExprAST *then, ExprAST *_else)
   : Cond(cond), Then(then), Else(_else) {}
   virtual Value *Codegen();
+  virtual Type *getType() const { 
+    assert(Then->getType() == Else->getType());
+    return Then->getType();
+  }
 };
 
 /// ForExprAST - Expression class for for/in.
@@ -183,14 +251,15 @@ public:
 
 /// VarExprAST - Expression class for var/in
 class VarExprAST : public ExprAST {
-  std::vector<std::pair<std::string, ExprAST*> > VarNames;
+  typedef std::vector<std::pair<VariableExprAST*, ExprAST*> > VarList;
+  VarList Variables;
   ExprAST *Body;
 public:
-  VarExprAST(const std::vector<std::pair<std::string, ExprAST*> > &varnames,
-             ExprAST *body)
-  : VarNames(varnames), Body(body) {}
+  VarExprAST(VarList &variables, ExprAST *body)
+  : Variables(variables), Body(body) {}
   
   virtual Value *Codegen();
+  virtual Type *getType() const { return Body->getType(); }
 };
 
 /// PrototypeAST - This class represents the "prototype" for a function,
@@ -198,12 +267,16 @@ public:
 class PrototypeAST {
   std::string Name;
   std::vector<std::string> Args;
+  std::vector<Type *> FormalTypes;
+  Type *ReturnType;
   bool isOperator;
   unsigned Precedence;  // Precedence if a binary op.
 public:
   PrototypeAST(const std::string &name, const std::vector<std::string> &args,
+               const std::vector<Type *> &formals, Type *ret,
                bool isoperator = false, unsigned prec = 0)
-  : Name(name), Args(args), isOperator(isoperator), Precedence(prec) {}
+  : Name(name), Args(args), FormalTypes(formals), ReturnType(ret), 
+    isOperator(isoperator), Precedence(prec) {}
   
   bool isUnaryOp() const { return isOperator && Args.size() == 1; }
   bool isBinaryOp() const { return isOperator && Args.size() == 2; }
@@ -218,6 +291,8 @@ public:
   Function *Codegen();
   
   void CreateArgumentAllocas(Function *F);
+
+  virtual Type *getType() const { return ReturnType; }
 };
 
 /// FunctionAST - This class represents a function definition itself.
@@ -229,6 +304,8 @@ public:
     : Proto(proto), Body(body) {}
   
   Function *Codegen();
+  
+  virtual Type *getType() const { return Proto->getType(); }
 };
 
 //===----------------------------------------------------------------------===//
@@ -258,11 +335,6 @@ static int GetTokPrecedence() {
   return TokPrec;
 }
 
-/// Error* - These are little helper functions for error handling.
-ExprAST *Error(const char *Str) { fprintf(stderr, "Error: %s\n", Str);return 0;}
-PrototypeAST *ErrorP(const char *Str) { Error(Str); return 0; }
-FunctionAST *ErrorF(const char *Str) { Error(Str); return 0; }
-
 static ExprAST *ParseExpression();
 
 /// identifierexpr
@@ -270,6 +342,7 @@ static ExprAST *ParseExpression();
 ///   ::= identifier '(' expression* ')'
 static ExprAST *ParseIdentifierExpr() {
   std::string IdName = IdentifierStr;
+  std::string MapFunction;
   
   getNextToken();  // eat identifier.
   
@@ -278,6 +351,18 @@ static ExprAST *ParseIdentifierExpr() {
   
   // Call.
   getNextToken();  // eat (
+
+  if (IdName == "map") { 
+    if (CurTok != tok_identifier) { 
+      ErrorP("Expected identifier for first map argument");
+    } 
+    MapFunction = IdentifierStr;
+    getNextToken();
+    if (CurTok != ',')
+      return Error("Expected ')' or ',' in argument list");
+    getNextToken();
+  } 
+
   std::vector<ExprAST*> Args;
   if (CurTok != ')') {
     while (1) {
@@ -296,7 +381,12 @@ static ExprAST *ParseIdentifierExpr() {
   // Eat the ')'.
   getNextToken();
   
-  return new CallExprAST(IdName, Args);
+  if (IdName == "map") { 
+    return new MapExprAST(MapFunction, Args);
+  } 
+  else { 
+    return new CallExprAST(IdName, Args);
+  }
 }
 
 /// numberexpr ::= number
@@ -391,33 +481,54 @@ static ExprAST *ParseForExpr() {
 static ExprAST *ParseVarExpr() {
   getNextToken();  // eat the var.
 
-  std::vector<std::pair<std::string, ExprAST*> > VarNames;
-
-  // At least one variable name is required.
-  if (CurTok != tok_identifier)
-    return Error("expected identifier after var");
-  
+  std::vector<std::pair<VariableExprAST*, ExprAST*> > VarNames;
+ 
   while (1) {
-    std::string Name = IdentifierStr;
-    getNextToken();  // eat identifier.
+    if (CurTok == tok_vector) {
+      getNextToken(); // eat 'vector'
+      std::string Name = IdentifierStr;
+      ExprAST *Length = 0;
 
-    // Read the optional initializer.
-    ExprAST *Init = 0;
-    if (CurTok == '=') {
-      getNextToken(); // eat the '='.
+      getNextToken(); // eat identifier.
+
+      if (CurTok != '[') 
+        return Error("expected opening '[' in vector definition");
+
+      getNextToken(); // eat the '['.
+
+      Length = ParseExpression();
+      if (Length == 0) return 0;
       
-      Init = ParseExpression();
-      if (Init == 0) return 0;
+      if (CurTok != ']')
+        return Error("expected closing ']' in vector definition");
+
+      getNextToken(); // eat the ']'
+
+      VarNames.push_back(std::make_pair(new VectorVariableExprAST(Name, Length), (ExprAST*)0));
     }
+    else if (CurTok == tok_identifier) {
+      std::string Name = IdentifierStr;
+      ExprAST *Init = 0;
+      getNextToken();  // eat identifier.
     
-    VarNames.push_back(std::make_pair(Name, Init));
+      // Read the optional initializer.
+      if (CurTok == '=') { // Read the optional initializer.
+        getNextToken(); // eat the '='.
+      
+        Init = ParseExpression();
+        if (Init == 0) return 0;
+      }
+
+      VarNames.push_back(std::make_pair(new VariableExprAST(Name), Init));
+    } 
+    else { // (CurTok != tok_identifier && CurTok != tok_vector)
+      // At least one variable name is required.
+      return Error("expected identifier or 'vector' after var");
+    }
     
     // End of var list, exit loop.
     if (CurTok != ',') break;
     getNextToken(); // eat the ','.
-    
-    if (CurTok != tok_identifier)
-      return Error("expected identifier list after var");
   }
   
   // At this point, we have to have 'in'.
@@ -509,11 +620,25 @@ static ExprAST *ParseExpression() {
   return ParseBinOpRHS(0, LHS);
 }
 
+static Type *ParseType() {
+  // Default to double unless 'vector' specified.
+  Type *t = Type::getDoubleTy(getGlobalContext());
+
+  if (CurTok == tok_vector) {
+    t = DVecType;
+    getNextToken(); // eat 'vector'
+  }
+
+  return t;
+}
+
 /// prototype
-///   ::= id '(' id* ')'
+///   ::= [vector] id '(' ([vector] id)* ')'
 ///   ::= binary LETTER number? (id, id)
 ///   ::= unary LETTER (id)
 static PrototypeAST *ParsePrototype() {
+  Type *returnType = ParseType();
+
   std::string FnName;
   
   unsigned Kind = 0; // 0 = identifier, 1 = unary, 2 = binary.
@@ -557,10 +682,20 @@ static PrototypeAST *ParsePrototype() {
   
   if (CurTok != '(')
     return ErrorP("Expected '(' in prototype");
+
+   getNextToken(); // eat '('
   
   std::vector<std::string> ArgNames;
-  while (getNextToken() == tok_identifier)
-    ArgNames.push_back(IdentifierStr);
+  std::vector<Type*> FormalTypes;
+  while (CurTok != ')') { 
+     Type *type = ParseType(); 
+     if (CurTok != tok_identifier) { 
+        return ErrorP("Expected identifier name");
+     } 
+     FormalTypes.push_back(type);
+     ArgNames.push_back(IdentifierStr);
+     getNextToken();
+  }
   if (CurTok != ')')
     return ErrorP("Expected ')' in prototype");
   
@@ -571,7 +706,7 @@ static PrototypeAST *ParsePrototype() {
   if (Kind && ArgNames.size() != Kind)
     return ErrorP("Invalid number of operands for operator");
   
-  return new PrototypeAST(FnName, ArgNames, Kind != 0, BinaryPrecedence);
+  return new PrototypeAST(FnName, ArgNames, FormalTypes, returnType, Kind != 0, BinaryPrecedence);
 }
 
 /// definition ::= 'def' prototype expression
@@ -589,7 +724,7 @@ static FunctionAST *ParseDefinition() {
 static FunctionAST *ParseTopLevelExpr() {
   if (ExprAST *E = ParseExpression()) {
     // Make an anonymous proto.
-    PrototypeAST *Proto = new PrototypeAST("", std::vector<std::string>());
+    PrototypeAST *Proto = new PrototypeAST("", std::vector<std::string>(), std::vector<Type*>(), DoubleType);
     return new FunctionAST(Proto, E);
   }
   return 0;
@@ -604,11 +739,6 @@ static PrototypeAST *ParseExtern() {
 //===----------------------------------------------------------------------===//
 // Code Generation
 //===----------------------------------------------------------------------===//
-
-static Module *TheModule;
-static IRBuilder<> Builder(getGlobalContext());
-static std::map<std::string, AllocaInst*> NamedValues;
-static FunctionPassManager *TheFPM;
 
 Value *ErrorV(const char *Str) { Error(Str); return 0; }
 
@@ -627,6 +757,15 @@ Value *NumberExprAST::Codegen() {
 }
 
 Value *VariableExprAST::Codegen() {
+  // Look this variable up in the function.
+  Value *V = NamedValues[Name];
+  if (V == 0) return ErrorV("Unknown variable name");
+
+  // Load the value.
+  return Builder.CreateLoad(V, Name.c_str());
+}
+
+Value *VectorVariableExprAST::Codegen() {
   // Look this variable up in the function.
   Value *V = NamedValues[Name];
   if (V == 0) return ErrorV("Unknown variable name");
@@ -693,6 +832,7 @@ Value *BinaryExprAST::Codegen() {
 Value *CallExprAST::Codegen() {
   // Look up the name in the global module table.
   Function *CalleeF = TheModule->getFunction(Callee);
+  
   if (CalleeF == 0)
     return ErrorV("Unknown function referenced");
   
@@ -707,6 +847,27 @@ Value *CallExprAST::Codegen() {
   }
   
   return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+Value *MapExprAST::Codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = TheModule->getFunction(Callee);
+  
+  if (CalleeF == 0)
+    return ErrorV("Unknown function referenced");
+
+  Value *CalleeName = Builder.CreateGlobalStringPtr(CalleeF->getName());
+  std::vector<Value*> ArgsV;
+  ArgsV.push_back(CalleeName);
+
+  // allocate a vector for the return value and pass
+  // it as an argument to the vectormap routine. 
+  AllocaInst *alloca = Builder.CreateAlloca(DVecType);
+  ArgsV.push_back(alloca);
+
+  // not finished...
+
+  return 0;
 }
 
 Value *IfExprAST::Codegen() {
@@ -765,7 +926,7 @@ Value *IfExprAST::Codegen() {
 // for one extra iteration compared to loops in other languages like C. See
 // [LLVM bug 13266][1]
 //
-// [1]: 
+// [1]: http://llvm.org/bugs/show_bug.cgi?id=13266
 Value *ForExprAST::Codegen() {
   // Output this as:
   //   var = alloca double
@@ -877,9 +1038,8 @@ Value *VarExprAST::Codegen() {
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
 
   // Register all variables and emit their initializer.
-  for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
-    const std::string &VarName = VarNames[i].first;
-    ExprAST *Init = VarNames[i].second;
+  for (unsigned i = 0, e = Variables.size(); i != e; ++i) {
+    ExprAST *Init = Variables[i].second;
     
     // Emit the initializer before adding the variable to scope, this prevents
     // the initializer from referencing the variable itself, and permits stuff
@@ -893,16 +1053,31 @@ Value *VarExprAST::Codegen() {
     } else { // If not specified, use 0.0.
       InitVal = ConstantFP::get(getGlobalContext(), APFloat(0.0));
     }
-    
-    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
-    Builder.CreateStore(InitVal, Alloca);
+
+    AllocaInst *Alloca = 0;
+    VariableExprAST *Variable = Variables[i].first;
+
+    if (Variable->isVector()) {
+      Value *LengthValFP = static_cast<VectorVariableExprAST*>(Variable)->getLength()->Codegen(); 
+      Alloca = Builder.CreateAlloca(DVecType);
+      std::vector<Value*> ArgsV;
+      ArgsV.push_back(Alloca);
+      ArgsV.push_back(LengthValFP);
+
+      Function *DVecMalloc = TheModule->getFunction("malloc_vector");
+      Builder.CreateCall(DVecMalloc, ArgsV);
+    }
+    else {
+      Alloca = CreateEntryBlockAlloca(TheFunction, Variable->getName());
+      Builder.CreateStore(InitVal, Alloca);
+    }   
 
     // Remember the old variable binding so that we can restore the binding when
     // we unrecurse.
-    OldBindings.push_back(NamedValues[VarName]);
+    OldBindings.push_back(NamedValues[Variable->getName()]);
     
     // Remember this binding.
-    NamedValues[VarName] = Alloca;
+    NamedValues[Variable->getName()] = Alloca;
   }
   
   // Codegen the body, now that all vars are in scope.
@@ -910,8 +1085,8 @@ Value *VarExprAST::Codegen() {
   if (BodyVal == 0) return 0;
   
   // Pop all our variables from scope.
-  for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
-    NamedValues[VarNames[i].first] = OldBindings[i];
+  for (unsigned i = 0, e = Variables.size(); i != e; ++i)
+    NamedValues[Variables[i].first->getName()] = OldBindings[i];
 
   // Return the body computation.
   return BodyVal;
@@ -1096,9 +1271,83 @@ double printd(double X) {
   return 0;
 }
 
+/// printVector - printf that prints all elements of a DVec
+extern "C" 
+#ifdef WIN32
+__declspec(dllexport)
+#endif
+double printVector(DVector *x) {
+  for (int i = 0; i < x->length; i++) {
+    printf("%0.2f ", x->ptr[i]);
+    if (i%10 == 9) printf("\n");
+  }
+  return 0;
+}
+
+/// malloc_vector -- allocate memory for a DVector
+extern "C" 
+#ifdef WIN32
+__declspec(dllexport)
+#endif
+void malloc_vector(DVector *vp, double dlength) 
+{
+  int bytes = (int) (sizeof(double)*dlength);
+  vp->ptr = (double *)malloc(bytes);
+  vp->length = dlength;
+}
+
+/// free_vector -- free memory for a DVector
+extern "C"
+#ifdef WIN32
+__declspec(dllexport)
+#endif
+void free_vector(DVector *vp)
+{
+  free(vp->ptr);
+}
+
 //===----------------------------------------------------------------------===//
 // Main driver code.
 //===----------------------------------------------------------------------===//
+
+void InitTypes() {
+
+  DoubleType = Type::getDoubleTy(getGlobalContext());
+
+  // Create vector type 
+  DVecType = TheModule->getTypeByName("dvec");
+  if (!DVecType) {
+    DVecType = StructType::create(getGlobalContext(), "dvec");
+  }
+
+  std::vector<Type *> fields;
+  fields.push_back(PointerType::get(DoubleType, 0));
+  fields.push_back(Type::getDoubleTy(getGlobalContext()));
+  fields.push_back(Type::getInt32Ty(getGlobalContext()));
+  
+  if (DVecType->isOpaque()) {
+    DVecType->setBody(fields, /*isPacked=*/false);
+  }
+
+  DVecPtrType = PointerType::get(DVecType, 0); 
+}
+
+void Init() {
+  // declare malloc_vector
+  std::vector<Type *> malloc_paramTypes;
+  malloc_paramTypes.push_back(DVecPtrType); 
+  malloc_paramTypes.push_back(Type::getDoubleTy(getGlobalContext()));
+  FunctionType *malloc_vectorType = FunctionType::get(Type::getVoidTy(getGlobalContext()), malloc_paramTypes, false);
+  Function *malloc_vectorFunc = Function::Create(malloc_vectorType, Function::ExternalLinkage, "malloc_vector", TheModule); 
+  TheExecutionEngine->addGlobalMapping(malloc_vectorFunc, (void *)malloc_vector);
+
+  // declare free_vector
+  std::vector<Type *> free_paramTypes;
+  free_paramTypes.push_back(DVecPtrType); 
+  FunctionType *free_vectorType = FunctionType::get(Type::getVoidTy(getGlobalContext()), free_paramTypes, false);
+  Function *free_vectorFunc = Function::Create(free_vectorType, Function::ExternalLinkage, "free_vector", TheModule); 
+  TheExecutionEngine->addGlobalMapping(free_vectorFunc, (void *)free_vector);
+}
 
 int main(int argc, char** argv) {
 
@@ -1123,6 +1372,8 @@ int main(int argc, char** argv) {
   // Make the module, which holds all the code.
   TheModule = new Module("my cool jit", Context);
 
+  InitTypes();
+
   // Create the JIT.  This takes ownership of the module.
   std::string ErrStr;
   TheExecutionEngine = EngineBuilder(TheModule).setErrorStr(&ErrStr).create();
@@ -1130,6 +1381,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Could not create ExecutionEngine: %s\n", ErrStr.c_str());
     exit(1);
   }
+
+  Init();
 
   FunctionPassManager OurFPM(TheModule);
 
