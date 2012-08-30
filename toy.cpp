@@ -16,6 +16,8 @@
 #include <vector>
 using namespace llvm;
 
+#include "vector.h"
+
 //===----------------------------------------------------------------------===//
 // Lexer
 //===----------------------------------------------------------------------===//
@@ -50,15 +52,10 @@ static StructType* DVecType = NULL;
 static PointerType* DVecPtrType = NULL;
 static Type* DoubleType = NULL;
 
-struct DVector {
-  double  *ptr;      
-  int     length;
-};
-
-static Module *TheModule;
-static IRBuilder<> Builder(getGlobalContext());
-static std::map<std::string, AllocaInst*> NamedValues;
-static FunctionPassManager *TheFPM;
+Module *TheModule;
+IRBuilder<> Builder(getGlobalContext());
+std::map<std::string, AllocaInst*> NamedValues;
+FunctionPassManager *TheFPM;
 
 static FILE *Infile = stdin;       // where to read input
 
@@ -724,7 +721,11 @@ static FunctionAST *ParseDefinition() {
 static FunctionAST *ParseTopLevelExpr() {
   if (ExprAST *E = ParseExpression()) {
     // Make an anonymous proto.
-    PrototypeAST *Proto = new PrototypeAST("", std::vector<std::string>(), std::vector<Type*>(), DoubleType);
+    PrototypeAST *Proto;
+    if (E->getType() == DVecType)
+      Proto = new PrototypeAST("", std::vector<std::string>(), std::vector<Type*>(), DVecType);
+    else
+      Proto = new PrototypeAST("", std::vector<std::string>(), std::vector<Type*>(), DoubleType);
     return new FunctionAST(Proto, E);
   }
   return 0;
@@ -744,8 +745,8 @@ Value *ErrorV(const char *Str) { Error(Str); return 0; }
 
 /// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
 /// the function.  This is used for mutable variables etc.
-static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
-                                          const std::string &VarName) {
+AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
+                                   const std::string &VarName) {
   IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
                  TheFunction->getEntryBlock().begin());
   return TmpB.CreateAlloca(Type::getDoubleTy(getGlobalContext()), 0,
@@ -862,12 +863,56 @@ Value *MapExprAST::Codegen() {
 
   // allocate a vector for the return value and pass
   // it as an argument to the vectormap routine. 
-  AllocaInst *alloca = Builder.CreateAlloca(DVecType);
-  ArgsV.push_back(alloca);
+  AllocaInst *RetVal = Builder.CreateAlloca(DVecType);
+  ArgsV.push_back(RetVal);
 
-  // not finished...
+  // Allocate an array to hold the argument vectors.
+  Value *argsize = ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), CalleeF->arg_size());
+  AllocaInst *argsvect = Builder.CreateAlloca(DVecType, argsize);
+  Value *idx0 = ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), 0);
+  Value *idx1 = ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), 1);
 
-  return 0;
+  std::vector<unsigned> a0; a0.push_back(0);
+  std::vector<unsigned> a1; a1.push_back(1);
+
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    Value *argi = Args[i]->Codegen();
+    
+    // extract arg pointer
+    Value *ptr  =  Builder.CreateExtractValue(argi, a0, "extr_ptr");   
+
+    // extract arg vector length
+    Value *length =  Builder.CreateExtractValue(argi, a1, "extr_len");
+    
+    // store ptr to argsvect
+    std::vector<Value *> indexp;
+    indexp.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), i));
+    indexp.push_back(idx0);
+    Value *gep = Builder.CreateGEP(argsvect, indexp, "gep");
+    Builder.CreateStore(ptr, gep);
+
+    // store length to argsvect
+    std::vector<Value *> indexp1;
+    indexp1.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), i));
+    indexp1.push_back(idx1);
+    Value *gep2 = Builder.CreateGEP(argsvect, indexp1, "gep");
+    Builder.CreateStore(length, gep2);
+  }
+  ArgsV.push_back(argsvect);
+
+  Function *MapF = TheModule->getFunction("vector_map");
+  Builder.CreateCall(MapF, ArgsV);
+
+  // return value is available in RetVal.
+  Value *retval = Builder.CreateLoad(RetVal,"result");
+  
+  Value *ptr  =  Builder.CreateExtractValue(retval, a0, "extr_ptr");
+  Value *len =  Builder.CreateExtractValue(retval, a1, "extr_len");
+
+  Value *DVec = UndefValue::get(DVecType);
+  DVec =  Builder.CreateInsertValue(DVec, ptr, a0, "ins_ptr") ;
+  DVec =  Builder.CreateInsertValue(DVec, len, a1, "ins_len") ;
+  return DVec;
 }
 
 Value *IfExprAST::Codegen() {
@@ -1064,7 +1109,7 @@ Value *VarExprAST::Codegen() {
       ArgsV.push_back(Alloca);
       ArgsV.push_back(LengthValFP);
 
-      Function *DVecMalloc = TheModule->getFunction("malloc_vector");
+      Function *DVecMalloc = TheModule->getFunction("vector_malloc");
       Builder.CreateCall(DVecMalloc, ArgsV);
     }
     else {
@@ -1083,21 +1128,27 @@ Value *VarExprAST::Codegen() {
   // Codegen the body, now that all vars are in scope.
   Value *BodyVal = Body->Codegen();
   if (BodyVal == 0) return 0;
-  
-  // Pop all our variables from scope.
-  for (unsigned i = 0, e = Variables.size(); i != e; ++i)
+ 
+  // Free vectors and Pop all our variables from scope.
+  for (unsigned i = 0, e = Variables.size(); i != e; ++i) {
+    // Create call to free vectors
+    if (Variables[i].first->isVector()) {
+      std::vector<Value*> ArgsV;
+      ArgsV.push_back(NamedValues[Variables[i].first->getName()]);
+
+      Function *DVecFree = TheModule->getFunction("vector_free");
+      Builder.CreateCall(DVecFree, ArgsV);
+    }
+
     NamedValues[Variables[i].first->getName()] = OldBindings[i];
+  }
 
   // Return the body computation.
   return BodyVal;
 }
 
 Function *PrototypeAST::Codegen() {
-  // Make the function type:  double(double,double) etc.
-  std::vector<Type*> Doubles(Args.size(), 
-                             Type::getDoubleTy(getGlobalContext()));
-  FunctionType *FT = FunctionType::get(Type::getDoubleTy(getGlobalContext()),
-                                       Doubles, false);
+  FunctionType *FT = FunctionType::get(ReturnType, FormalTypes, false);
   
   Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule);
   
@@ -1284,12 +1335,12 @@ double printVector(DVector *x) {
   return 0;
 }
 
-/// malloc_vector -- allocate memory for a DVector
+/// vector_malloc -- allocate memory for a DVector
 extern "C" 
 #ifdef WIN32
 __declspec(dllexport)
 #endif
-void malloc_vector(DVector *vp, double dlength) 
+void vector_malloc(DVector *vp, double dlength) 
 {
   int bytes = (int) (sizeof(double)*dlength);
   vp->ptr = (double *)malloc(bytes);
@@ -1301,7 +1352,16 @@ extern "C"
 #ifdef WIN32
 __declspec(dllexport)
 #endif
-void free_vector(DVector *vp)
+void vector_free(DVector *vp)
+{
+  free(vp->ptr);
+}
+
+extern "C"
+#ifdef WIN32
+__declspec(dllexport)
+#endif
+void map_vector(DVector *vp)
 {
   free(vp->ptr);
 }
@@ -1333,20 +1393,30 @@ void InitTypes() {
 }
 
 void Init() {
-  // declare malloc_vector
+  // declare vector_malloc
   std::vector<Type *> malloc_paramTypes;
   malloc_paramTypes.push_back(DVecPtrType); 
   malloc_paramTypes.push_back(Type::getDoubleTy(getGlobalContext()));
-  FunctionType *malloc_vectorType = FunctionType::get(Type::getVoidTy(getGlobalContext()), malloc_paramTypes, false);
-  Function *malloc_vectorFunc = Function::Create(malloc_vectorType, Function::ExternalLinkage, "malloc_vector", TheModule); 
-  TheExecutionEngine->addGlobalMapping(malloc_vectorFunc, (void *)malloc_vector);
+  FunctionType *vector_mallocType = FunctionType::get(Type::getVoidTy(getGlobalContext()), malloc_paramTypes, false);
+  Function *vector_mallocFunc = Function::Create(vector_mallocType, Function::ExternalLinkage, "vector_malloc", TheModule); 
+  TheExecutionEngine->addGlobalMapping(vector_mallocFunc, (void *)vector_malloc);
 
-  // declare free_vector
+  // declare vector_free
   std::vector<Type *> free_paramTypes;
   free_paramTypes.push_back(DVecPtrType); 
-  FunctionType *free_vectorType = FunctionType::get(Type::getVoidTy(getGlobalContext()), free_paramTypes, false);
-  Function *free_vectorFunc = Function::Create(free_vectorType, Function::ExternalLinkage, "free_vector", TheModule); 
-  TheExecutionEngine->addGlobalMapping(free_vectorFunc, (void *)free_vector);
+  FunctionType *vector_freeType = FunctionType::get(Type::getVoidTy(getGlobalContext()), free_paramTypes, false);
+  Function *vector_freeFunc = Function::Create(vector_freeType, Function::ExternalLinkage, "vector_free", TheModule); 
+  TheExecutionEngine->addGlobalMapping(vector_freeFunc, (void *)vector_free);
+
+  // declare vector_map  
+  std::vector<Type *> map_params;
+  map_params.push_back(PointerType::getUnqual(Type::getInt8Ty(getGlobalContext()))); 
+  map_params.push_back(DVecPtrType); 
+  map_params.push_back(DVecPtrType); 
+  FunctionType *vector_mapType = FunctionType::get(Type::getVoidTy(getGlobalContext()), map_params, false); 
+  Function *vector_mapFunc = Function::Create(vector_mapType, Function::ExternalLinkage, "vector_map", TheModule);
+  TheExecutionEngine->addGlobalMapping(vector_mapFunc, (void *)vector_map);
+
 }
 
 int main(int argc, char** argv) {
