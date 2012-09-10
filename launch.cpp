@@ -75,7 +75,7 @@ CUresult initCUDA(const char *kernelname,
     checkCudaErrors(cuCtxCreate(phContext, CU_CTX_BLOCKING_SYNC, *phDevice));
 
     // Load the PTX 
-    checkCudaErrors(cuModuleLoad(phModule, ptx));
+    checkCudaErrors(cuModuleLoadData(phModule, ptx));
 
     // Locate the kernel entry point
     
@@ -89,7 +89,7 @@ void LaunchOnGpu(const char *kernel,
                  unsigned N, 
                  void **args, 
                  void *resbuf,
-                 const char *filename) 
+                 const char *ptxBuff) 
 { 
   const unsigned int nThreads = N;
   CUcontext    hContext = 0;
@@ -101,7 +101,7 @@ void LaunchOnGpu(const char *kernel,
   unsigned int nBlocks  = 1;
 
   // Initialize the device and get a handle to the kernel
-  checkCudaErrors(initCUDA(kernel, &hContext, &hDevice, &hModule, &hKernel, filename));
+  checkCudaErrors(initCUDA(kernel, &hContext, &hDevice, &hModule, &hKernel, ptxBuff));
 
   // Allocate memory for result vector on the host and device
   h_data = (double *)resbuf;

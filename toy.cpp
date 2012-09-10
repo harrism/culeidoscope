@@ -10,13 +10,14 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Support/IRBuilder.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <cstdio>
 #include <string>
 #include <map>
 #include <vector>
-using namespace llvm;
+#include "nvvm.h"
 
-#include "vector.h"
+using namespace llvm;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -48,6 +49,11 @@ enum Token {
 };
 
 // Types
+struct DVector {
+  double  *ptr;      
+  int     length;
+};
+
 static StructType* DVecType = NULL;
 static PointerType* DVecPtrType = NULL;
 static Type* DoubleType = NULL;
@@ -65,6 +71,13 @@ static double NumVal;              // Filled in if tok_number
 class ExprAST;
 class PrototypeAST;
 class FunctionAST;
+
+// GPU JIT functions
+extern void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, 
+                                    std::string &kernelname) ; 
+extern char *BitCodeToPtx(llvm::Module *M);
+void LaunchOnGpu(const char *kernel, unsigned funcarity, unsigned N, void **args, 
+                 void *resbuf, const char *filename);
 
 /// Error* - These are little helper functions for error handling.
 ExprAST *Error(const char *Str) { fprintf(stderr, "Error: %s\n", Str); return 0;}
@@ -915,6 +928,42 @@ Value *MapExprAST::Codegen() {
   return DVec;
 }
 
+void 
+vector_map(char *name, DVector *res, DVector *args) { 
+  
+  Module *M = CloneModule(TheModule);
+  
+  // Look up the name in the global module table.
+  Function *CalleeF = M->getFunction(name);
+  if (CalleeF == NULL) {
+     ErrorP("Undefined function name");
+     return;
+  }
+
+  unsigned arity = CalleeF->arg_size();
+
+  std::string kernel; 
+  CreateNVVMWrapperKernel(M, CalleeF, Builder, kernel); 
+  char *ptxBuff = BitCodeToPtx(M);
+  
+  void **argsbuf = (void **) malloc(sizeof(void *)*arity);
+  unsigned pos;
+  
+  for (pos = 0; pos < arity; pos++) 
+    argsbuf[pos] = args[pos].ptr;
+  
+  res->length = args[0].length;
+  res->ptr = (double *) malloc(res->length * sizeof(double));  
+  
+  if (res->ptr == NULL) { 
+     fprintf(stderr,"Could not allocate host memory\n" );
+     return ;
+  } 
+  
+  LaunchOnGpu(kernel.c_str(), arity, res->length, argsbuf, res->ptr, ptxBuff);
+} 
+
+
 Value *IfExprAST::Codegen() {
   Value *CondV = Cond->Codegen();
   if (CondV == 0) return 0;
@@ -1327,9 +1376,9 @@ extern "C"
 #ifdef WIN32
 __declspec(dllexport)
 #endif
-double printVector(DVector *x) {
-  for (int i = 0; i < x->length; i++) {
-    printf("%0.2f ", x->ptr[i]);
+double printVector(DVector x) {
+  for (int i = 0; i < x.length; i++) {
+    printf("%0.2f ", x.ptr[i]);
     if (i%10 == 9) printf("\n");
   }
   return 0;
@@ -1357,15 +1406,6 @@ void vector_free(DVector *vp)
   free(vp->ptr);
 }
 
-extern "C"
-#ifdef WIN32
-__declspec(dllexport)
-#endif
-void map_vector(DVector *vp)
-{
-  free(vp->ptr);
-}
-
 //===----------------------------------------------------------------------===//
 // Main driver code.
 //===----------------------------------------------------------------------===//
@@ -1382,7 +1422,6 @@ void InitTypes() {
 
   std::vector<Type *> fields;
   fields.push_back(PointerType::get(DoubleType, 0));
-  fields.push_back(Type::getDoubleTy(getGlobalContext()));
   fields.push_back(Type::getInt32Ty(getGlobalContext()));
   
   if (DVecType->isOpaque()) {
@@ -1427,6 +1466,13 @@ int main(int argc, char** argv) {
   InitializeNativeTarget();
   LLVMContext &Context = getGlobalContext();
 
+  //initialize the nvvm library. 
+  unsigned result = nvvmInit(); 
+  if (result != 0) { 
+    fprintf(stderr, "Couldn't initialize nvvm\n"); 
+    exit(-1);
+  } 
+
   // Install standard binary operators.
   // 1 is lowest precedence.
   BinopPrecedence['='] = 2;
@@ -1441,6 +1487,18 @@ int main(int argc, char** argv) {
 
   // Make the module, which holds all the code.
   TheModule = new Module("my cool jit", Context);
+  std::string lTargDescrStr;
+  if (sizeof(void *) == 8) { // pointer size, alignment == 8
+    lTargDescrStr= "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-"
+                   "i64:64:64-f32:32:32-f64:64:64-v16:16:16-"
+                   "v32:32:32-v64:64:64-v128:128:128-n16:32:64";
+  } else {
+    lTargDescrStr= "e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-"
+                   "i64:64:64-f32:32:32-f64:64:64-v16:16:16-"
+                   "v32:32:32-v64:64:64-v128:128:128-n16:32:64";
+  }
+
+  TheModule->setDataLayout(lTargDescrStr);
 
   InitTypes();
 
@@ -1484,6 +1542,13 @@ int main(int argc, char** argv) {
 
   // Print out all of the generated code.
   TheModule->dump();
+
+  // shut down NVVM library
+  result = nvvmFini();
+  if (result != 0) { 
+    fprintf(stderr, "nvvmFini() failed\n"); 
+    exit(-1);
+  } 
 
   return 0;
 }

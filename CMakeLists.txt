@@ -4,8 +4,6 @@ set(LLVM_REQUIRES_RTTI 1)
 #Searching CUDA
 find_package(CUDA REQUIRED)
 
-include_directories(${CUDA_INCLUDE_DIRS})
-
 set( NVVM_BASE C:/src/libNVVM/lib/ )
 
 if (WIN32)
@@ -28,15 +26,14 @@ else (WIN32) # todo add support for Mac
   endif( CMAKE_SIZEOF_VOID_P EQUAL 8 )
 endif (WIN32)
 
+include_directories(${CUDA_INCLUDE_DIRS} ${NVVM_HOME})
+
 message(STATUS ${CUDA_TOOLKIT_ROOT_DIR})
 message(STATUS ${NVVM_HOME})
 
 add_llvm_example(culeidoscope
   toy.cpp
-  vector.cpp
-  vector.h
   nvvmwrapper.cpp
-  nvvmwrapper.h
   launch.cpp
   drvapi_error_string.h
   )

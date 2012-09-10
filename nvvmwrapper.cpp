@@ -9,6 +9,7 @@
  *
  */
 
+// llvm headers
 #include "llvm/DerivedTypes.h"
 #include "llvm/LLVMContext.h"
 #include "llvm/Module.h"
@@ -16,14 +17,13 @@
 #include "llvm/Support/IRBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Bitcode/ReaderWriter.h"
-// llvm headers
+#include "llvm/Bitcode/BitstreamWriter.h"
 #include "llvm/Analysis/Verifier.h"
 #include "llvm/Bitcode/ReaderWriter.h"
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Target/TargetData.h"
-#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Value.h"
 
 
@@ -32,30 +32,88 @@
 #include <stdlib.h>
 #include <string>
 #include <map>
-#include <set>
 #include <vector>
+#include <deque>
+#include <set>
 #include <iostream>
 #include <sstream>
+#include "nvvm.h"
 using namespace llvm;
 
+
 extern Module *TheModule; 
-extern IRBuilder<> Builder; 
 extern std::map<std::string, AllocaInst*> NamedValues;
 
 extern AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
-                                          const std::string &VarName);
+                                   const std::string &VarName);
 
 static int lRunBitcodeVerifier(llvm::Module *fModule)
 {
   llvm::PassManager *PM;
   int error = 0;
   PM = new llvm::PassManager();
-  PM->add(llvm::createVerifierPass(llvm::ReturnStatusAction));
+  PM->add(llvm::createVerifierPass(llvm::PrintMessageAction));
   if (PM->run(*fModule)) {
     error = 1;
   }
   delete PM;
   return error;
+}
+
+void PruneUnrelatedFunctionsAndVariables(Module *M, std::string name)
+{ 
+  std::set<std::string> visited;
+  std::deque<std::string> worklist;
+  worklist.push_back(name);
+  while (!worklist.empty()) { 
+    std::string func = worklist.back(); 
+    worklist.pop_back();
+    visited.insert(func);
+    Function *F = M->getFunction(func);      
+    if (F == NULL) continue; 
+    for (Function::iterator bi=F->begin(), be=F->end(); bi!=be; ++bi) {
+      BasicBlock *bb = bi;
+      for (BasicBlock::iterator ii=bb->begin(), ie=bb->end(); ii!=ie; ++ii) {
+	      CallInst *call = dyn_cast<CallInst>(ii);
+        if (call == NULL) 
+          continue; 
+        Function *called = call->getCalledFunction();
+        if (called == NULL) continue;
+	      std::string calledname = called->getName();
+        if (visited.find(calledname) == visited.end()) { 
+          worklist.push_back(calledname);
+        } 
+	    }
+    }
+  }
+
+  // now walk the module and delete any unvisited functions.
+  for (Module::iterator I = M->begin(), E = M->end(); I != E; ) {
+    Function *F = I++;
+    if (visited.find(F->getName()) != visited.end()) 
+      continue;
+    if (!F->use_empty())
+      worklist.push_back(F->getName());
+    else
+      F->eraseFromParent();
+  }
+
+  while (!worklist.empty()) {
+    std::string func = worklist.front(); 
+    worklist.pop_front();
+    Function *F = M->getFunction(func);      
+    if (F == NULL) continue; 
+    if (!F->use_empty()) 
+      worklist.push_back(func);
+    else
+      F->eraseFromParent();
+  }
+
+  // now erase unused global variables
+  for (Module::global_iterator I = M->global_begin(); I != M->global_end(); ) {
+    GlobalVariable *V = I++;
+    V->eraseFromParent();
+  }
 }
 
 // To be able to evaluate an expression f() on a GPU, 
@@ -78,8 +136,9 @@ static int lRunBitcodeVerifier(llvm::Module *fModule)
 // Mark this with nvvm annotation as a kernel
 // function. 
 
-
 void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::string &kernelname) { 
+
+  PruneUnrelatedFunctionsAndVariables(M, F->getName());
 
   std::stringstream ss;
   ss << F->getName().data();
@@ -116,6 +175,10 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::
   Type *voidTy =  Type::getVoidTy(getGlobalContext());
   FunctionType *FT = FunctionType::get(voidTy,Params, false);
   Function *kerF = Function::Create(FT, Function::ExternalLinkage, kernelname, M);
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(getGlobalContext(), "entry", kerF);
+  Builder.SetInsertPoint(BB);
   
   // Set names for all arguments.
   unsigned Idx = 0;
@@ -128,21 +191,16 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::
     ss >> arg; 
     AI->setName(arg);
     
-    // Add arguments to variable symbol table.
-    
     // Create an alloca for this variable.
     AllocaInst *Alloca = CreateEntryBlockAlloca(kerF, arg);
 
     // Store the initial value into the alloca.
-    Builder.CreateStore(AI, Alloca);
+    //Builder.CreateStore(AI, Alloca);
 
     // Add arguments to variable symbol table.
     NamedValues[arg] = Alloca;
   }
 
-  // Create a new basic block to start insertion into.
-  BasicBlock *BB = BasicBlock::Create(getGlobalContext(), "entry", kerF);
-  Builder.SetInsertPoint(BB);
   std::vector<Value *> ArgsV;
   Value *tidreg = Builder.CreateCall(tidF, ArgsV, "calltmp");
   Idx = 0;
@@ -180,106 +238,64 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::
   MDNode *mdNode = MDNode::get(Context, Vals);
 
   nvvmannotate->addOperand(mdNode); 
+  // kerF->dump();
 } 
 
-int
-IRToBCFile(Module *M, std::string bcfile) { 
+
+
+char *BitCodeToPtx(Module *M)
+{
+  M->dump();
+
   if  (lRunBitcodeVerifier(M)) { 
     fprintf(stderr, "Verifier failed\n");
-    return 1; 
+    return 0; 
   } 
-  // write the bitcode to a file. 
-  std::string error = ""; 
-  raw_fd_ostream os(bcfile.c_str(), error); 
-  //  if (error != "") { 
-  //   fprintf(stderr, "failed to open bc file for writing\n");
-  //}  
-  WriteBitcodeToFile(M, os);
-  return 0;
-} 
 
+  // create memory buffer from LLVM Module
+  std::vector<unsigned char> Buffer;
+  llvm::BitstreamWriter Stream(Buffer);
+ 
+  Buffer.reserve(256*1024);
+  WriteBitcodeToStream(M, Stream);
 
-int FunctionArity(char *name) { 
-   std::string funcname = name;
-   Function *F = TheModule->getFunction(funcname);
-   
-   if (F == NULL) { 
-    return -1 ;
-   }  
-   return F->arg_size();
-} ;
-
-
-void RemoveIrrelevantFunctions(Module *M, std::string name)
-{ 
-  std::set<std::string> visited;
-  std::vector<std::string> worklist;
-  worklist.push_back(name);
-  while (!worklist.empty()) { 
-     std::string func = worklist.back(); 
-     worklist.pop_back();
-     visited.insert(func);
-     Function *F = M->getFunction(func);      
-     if (F == NULL) continue; 
-     for (Function::iterator bi=F->begin(), be=F->end(); bi!=be; ++bi) {
-         BasicBlock *bb = bi;
-         for (BasicBlock::iterator ii=bb->begin(), ie=bb->end(); ii!=ie; ++ii) {
-	   CallInst *call = dyn_cast<CallInst>(ii);
-           if (call == NULL) 
-             continue; 
-           Function *called = call->getCalledFunction();
-           if (called == NULL) continue;
-	   std::string calledname = called->getName();
-           if (visited.find(calledname) == visited.end()) { 
-             worklist.push_back(calledname);
-           } 
-	 }
-     }
+#define __NVVM_SAFE_CALL(X) do { \
+    nvvmResult ResCode = (X); \
+    if (ResCode != NVVM_SUCCESS) { \
+      fprintf(stderr,"NVVM call (%s) failed. Error Code : %d", #X, ResCode); \
+      exit(-1); \
+    } \
+  } while (0)
+ 
+  // generate PTX
+  nvvmCU CU;
+  size_t Size;
+  char *PtxBuf = 0;
+ 
+  __NVVM_SAFE_CALL(nvvmCreateCU(&CU));
+  const char *b = (const char *) &Buffer.front();
+  __NVVM_SAFE_CALL(nvvmCUAddModule(CU, b, Buffer.size()));
+  nvvmResult result = nvvmCompileCU(CU, /*numOptions = */0, /*options = */0);
+  if (result != NVVM_SUCCESS) {
+    size_t logSize = 0;
+    nvvmGetCompilationLogSize(CU, &logSize);
+    char *log = new char[logSize];
+    nvvmGetCompilationLog(CU, log);
+    printf("NVVM Compilation Log:\n%s\n", log);
+    delete [] log;
   }
-
-  // now walk the module and delete any unvisited functions.
-  for (Module::iterator I = M->begin(), E = M->end(); I != E; ) {
-     Function *F = I++;
-     if (visited.find(F->getName()) != visited.end()) 
-       continue;
-     F->eraseFromParent();
+  else {
+    __NVVM_SAFE_CALL(nvvmGetCompiledResultSize(CU, &Size));
+    PtxBuf = new char[Size+1];
+    __NVVM_SAFE_CALL(nvvmGetCompiledResult(CU, PtxBuf));
+    PtxBuf[Size] = 0; // Null terminate
+    __NVVM_SAFE_CALL(nvvmDestroyCU(&CU));
   }
-}
+  
+  return PtxBuf;
+ 
+#undef __NVVM_SAFE_CALL
+} // BitCodeToPtx
 
-int 
-CreatePtx(char *name, char *filename, std::string &kernelname) {
-   std::string funcname = name;
-   std::string ptxfilename = filename;
-   Module *M = CloneModule(TheModule);
-
-   RemoveIrrelevantFunctions(M,name);
-
-   Function *F = M->getFunction(funcname);
-   
-   if (F == NULL) { 
-    return -1 ;
-   }  
-   CreateNVVMWrapperKernel(M, F,Builder,kernelname);
-   if (IRToBCFile(M, "./tmp.bc")) {
-     fprintf(stderr, "ptx generation failed\n");
-     return -1 ;
-   }; 
-   std::stringstream ss;
-   char *nvvmcc=getenv("NVVMCC");
-   if (nvvmcc == NULL) { 
-     fprintf(stderr, "Set NVVMCC environment variable to point to right nvvmcc");
-     return -1; 
-   } 
-   ss << nvvmcc; 
-   ss << " ./tmp.bc -o ";
-   ss << ptxfilename; 
-   std::string nvvmcccmd = ss.str();
-   int result = system(nvvmcccmd.c_str());
-   if (result != 0) { 
-     fprintf(stderr, "ptx generation failed\n");
-     return -1;
-   }
-   return 0;
-} 
 
 
