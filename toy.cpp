@@ -166,22 +166,14 @@ public:
 class VariableExprAST : public ExprAST {
 protected:
   std::string Name;
-public:
-  VariableExprAST(const std::string &name) : Name(name) {}
-  const std::string &getName() const { return Name; }
-  virtual Value *Codegen();
-  virtual bool isVector() const { return false; }
-};
-
-class VectorVariableExprAST : public VariableExprAST {
   ExprAST *Length;
 public:
-  VectorVariableExprAST(const std::string &name, ExprAST *length) 
-    : VariableExprAST(name), Length(length) {}
+  VariableExprAST(const std::string &name, ExprAST *length = 0) : Name(name), Length(length) {}
+  const std::string &getName() const { return Name; }
   ExprAST *getLength() const { return Length; }
   virtual Value *Codegen();
-  virtual bool isVector() const { return true; }
-  virtual Type *getType() const { return DVecType; }
+  virtual bool isVector() const { return (Length != 0); }
+  virtual Type *getType() const { return isVector() ? DVecType : DoubleType; }
 };
 
 /// UnaryExprAST - Expression class for a unary operator.
@@ -514,7 +506,7 @@ static ExprAST *ParseVarExpr() {
 
       getNextToken(); // eat the ']'
 
-      VarNames.push_back(std::make_pair(new VectorVariableExprAST(Name, Length), (ExprAST*)0));
+      VarNames.push_back(std::make_pair(new VariableExprAST(Name, Length), (ExprAST*)0));
     }
     else if (CurTok == tok_identifier) {
       std::string Name = IdentifierStr;
@@ -771,15 +763,6 @@ Value *NumberExprAST::Codegen() {
 }
 
 Value *VariableExprAST::Codegen() {
-  // Look this variable up in the function.
-  Value *V = NamedValues[Name];
-  if (V == 0) return ErrorV("Unknown variable name");
-
-  // Load the value.
-  return Builder.CreateLoad(V, Name.c_str());
-}
-
-Value *VectorVariableExprAST::Codegen() {
   // Look this variable up in the function.
   Value *V = NamedValues[Name];
   if (V == 0) return ErrorV("Unknown variable name");
@@ -1152,7 +1135,7 @@ Value *VarExprAST::Codegen() {
     VariableExprAST *Variable = Variables[i].first;
 
     if (Variable->isVector()) {
-      Value *LengthValFP = static_cast<VectorVariableExprAST*>(Variable)->getLength()->Codegen(); 
+      Value *LengthValFP = Variable->getLength()->Codegen(); 
       Alloca = Builder.CreateAlloca(DVecType);
       std::vector<Value*> ArgsV;
       ArgsV.push_back(Alloca);
