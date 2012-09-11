@@ -209,11 +209,6 @@ public:
   CallExprAST(const std::string &callee, std::vector<ExprAST*> &args)
     : Callee(callee), Args(args) {}
   virtual Value *Codegen();
-  virtual Type *getType() const {
-    Function *CalleeF = TheModule->getFunction(Callee);
-    assert(CalleeF != 0);
-    return CalleeF->getReturnType();
-  }
 };
 
 /// MapExprAST - Expression class for map.
@@ -809,8 +804,14 @@ Value *BinaryExprAST::Codegen() {
   case '+': return Builder.CreateFAdd(L, R, "addtmp");
   case '-': return Builder.CreateFSub(L, R, "subtmp");
   case '*': return Builder.CreateFMul(L, R, "multmp");    
+  case '/': return Builder.CreateFDiv(L, R, "divtmp");    
   case '<':
     L = Builder.CreateFCmpULT(L, R, "cmptmp");
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder.CreateUIToFP(L, Type::getDoubleTy(getGlobalContext()),
+                                "booltmp");
+  case '>':
+    L = Builder.CreateFCmpUGT(L, R, "cmptmp");
     // Convert bool 0/1 to double 0.0 or 1.0
     return Builder.CreateUIToFP(L, Type::getDoubleTy(getGlobalContext()),
                                 "booltmp");
@@ -1460,9 +1461,11 @@ int main(int argc, char** argv) {
   // 1 is lowest precedence.
   BinopPrecedence['='] = 2;
   BinopPrecedence['<'] = 10;
+  BinopPrecedence['>'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 20;
   BinopPrecedence['*'] = 40;  // highest.
+  BinopPrecedence['/'] = 40;  
 
   // Prime the first token.
   fprintf(stderr, "ready> ");
