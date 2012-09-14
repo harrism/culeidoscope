@@ -1394,10 +1394,9 @@ extern "C"
 #ifdef WIN32
 __declspec(dllexport)
 #endif
-DVector randVector(DVector x, double range) {
+void randVector(DVector x, double range) {
   for (int i = 0; i < x.length; i++)
     x.ptr[i] = range * (double)rand() / (double)RAND_MAX;
-  return x;
 }
 
 

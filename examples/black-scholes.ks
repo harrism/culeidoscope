@@ -1,6 +1,6 @@
 extern printd(x);
 extern printVector(vector x);
-extern vector randVector(vector v range);
+extern randVector(vector v range);
 extern exp(x);
 extern log(x);
 extern sqrt(x);
