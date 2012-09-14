@@ -93,9 +93,9 @@ static int gettok() {
   while (isspace(LastChar))
     LastChar = fgetc(Infile);
 
-  if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+  if (isalpha(LastChar) || (LastChar == '_')) { // identifier: [a-zA-Z_][a-zA-Z_0-9]*
     IdentifierStr = LastChar;
-    while (isalnum((LastChar = fgetc(Infile))))
+    while (isalnum((LastChar = fgetc(Infile))) || (LastChar == '_'))
       IdentifierStr += LastChar;
 
     if (IdentifierStr == "def") return tok_def;
@@ -746,11 +746,11 @@ Value *ErrorV(const char *Str) { Error(Str); return 0; }
 /// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
 /// the function.  This is used for mutable variables etc.
 AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
-                                   const std::string &VarName) {
+                                   const std::string &VarName,
+                                   bool isVector) {
   IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
                  TheFunction->getEntryBlock().begin());
-  return TmpB.CreateAlloca(Type::getDoubleTy(getGlobalContext()), 0,
-                           VarName.c_str());
+  return TmpB.CreateAlloca(isVector ? DVecType : DoubleType, 0, VarName.c_str());
 }
 
 Value *NumberExprAST::Codegen() {
@@ -1029,7 +1029,7 @@ Value *ForExprAST::Codegen() {
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
 
   // Create an alloca for the variable in the entry block.
-  AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+  AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName, false);
   
   // Emit the start code first, without 'variable' in scope.
   Value *StartVal = Start->Codegen();
@@ -1137,7 +1137,7 @@ Value *VarExprAST::Codegen() {
 
     if (Variable->isVector()) {
       Value *LengthValFP = Variable->getLength()->Codegen(); 
-      Alloca = Builder.CreateAlloca(DVecType);
+      Alloca = CreateEntryBlockAlloca(TheFunction, Variable->getName(), true);
       std::vector<Value*> ArgsV;
       ArgsV.push_back(Alloca);
       ArgsV.push_back(LengthValFP);
@@ -1146,7 +1146,7 @@ Value *VarExprAST::Codegen() {
       Builder.CreateCall(DVecMalloc, ArgsV);
     }
     else {
-      Alloca = CreateEntryBlockAlloca(TheFunction, Variable->getName());
+      Alloca = CreateEntryBlockAlloca(TheFunction, Variable->getName(), false);
       Builder.CreateStore(InitVal, Alloca);
     }   
 
@@ -1220,8 +1220,8 @@ void PrototypeAST::CreateArgumentAllocas(Function *F) {
   Function::arg_iterator AI = F->arg_begin();
   for (unsigned Idx = 0, e = Args.size(); Idx != e; ++Idx, ++AI) {
     // Create an alloca for this variable.
-    AllocaInst *Alloca = CreateEntryBlockAlloca(F, Args[Idx]);
-
+    AllocaInst *Alloca = CreateEntryBlockAlloca(F, Args[Idx], DVecType == FormalTypes[Idx]);
+    
     // Store the initial value into the alloca.
     Builder.CreateStore(AI, Alloca);
 
@@ -1390,6 +1390,17 @@ void vector_free(DVector *vp)
   free(vp->ptr);
 }
 
+extern "C"
+#ifdef WIN32
+__declspec(dllexport)
+#endif
+DVector randVector(DVector x, double range) {
+  for (int i = 0; i < x.length; i++)
+    x.ptr[i] = range * (double)rand() / (double)RAND_MAX;
+  return x;
+}
+
+
 //===----------------------------------------------------------------------===//
 // Main driver code.
 //===----------------------------------------------------------------------===//
@@ -1439,7 +1450,6 @@ void Init() {
   FunctionType *vector_mapType = FunctionType::get(Type::getVoidTy(getGlobalContext()), map_params, false); 
   Function *vector_mapFunc = Function::Create(vector_mapType, Function::ExternalLinkage, "vector_map", TheModule);
   TheExecutionEngine->addGlobalMapping(vector_mapFunc, (void *)vector_map);
-
 }
 
 int main(int argc, char** argv) {

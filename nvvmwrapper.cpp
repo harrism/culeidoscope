@@ -45,7 +45,8 @@ extern Module *TheModule;
 extern std::map<std::string, AllocaInst*> NamedValues;
 
 extern AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
-                                   const std::string &VarName);
+                                          const std::string &VarName,
+                                          bool isVector);
 
 static int lRunBitcodeVerifier(llvm::Module *fModule)
 {
@@ -192,10 +193,7 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::
     AI->setName(arg);
     
     // Create an alloca for this variable.
-    AllocaInst *Alloca = CreateEntryBlockAlloca(kerF, arg);
-
-    // Store the initial value into the alloca.
-    //Builder.CreateStore(AI, Alloca);
+    AllocaInst *Alloca = CreateEntryBlockAlloca(kerF, arg, false);
 
     // Add arguments to variable symbol table.
     NamedValues[arg] = Alloca;
@@ -275,7 +273,9 @@ char *BitCodeToPtx(Module *M)
   __NVVM_SAFE_CALL(nvvmCreateCU(&CU));
   const char *b = (const char *) &Buffer.front();
   __NVVM_SAFE_CALL(nvvmCUAddModule(CU, b, Buffer.size()));
-  nvvmResult result = nvvmCompileCU(CU, /*numOptions = */0, /*options = */0);
+ 
+  //const char *options = "-target=verify";
+  nvvmResult result = nvvmCompileCU(CU, /*numOptions = */0, /*options = */0); //&options);
   if (result != NVVM_SUCCESS) {
     size_t logSize = 0;
     nvvmGetCompilationLogSize(CU, &logSize);

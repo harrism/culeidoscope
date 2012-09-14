@@ -75,8 +75,34 @@ CUresult initCUDA(const char *kernelname,
     checkCudaErrors(cuCtxCreate(phContext, CU_CTX_BLOCKING_SYNC, *phDevice));
 
     // Load the PTX 
-    checkCudaErrors(cuModuleLoadData(phModule, ptx));
+    {
+        const unsigned int jitNumOptions = 2;
+        CUjit_option *jitOptions = new CUjit_option[jitNumOptions];
+        void **jitOptVals = new void*[jitNumOptions];
 
+        // set up size of compilation log buffer
+        jitOptions[0] = CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES;
+        int jitLogBufferSize = 1024;
+        jitOptVals[0] = (void *)jitLogBufferSize;
+
+        // set up pointer to the compilation log buffer
+        jitOptions[1] = CU_JIT_INFO_LOG_BUFFER;
+        char *jitLogBuffer = new char[jitLogBufferSize];
+        jitOptVals[1] = jitLogBuffer;
+
+        // compile with set parameters
+        CUresult status = cuModuleLoadDataEx(phModule, ptx, jitNumOptions, jitOptions, (void **)jitOptVals);
+
+        if (CUDA_SUCCESS != status)
+          printf("> PTX JIT log:\n%s\n", jitLogBuffer);
+        
+        delete [] jitOptions;
+        delete [] jitOptVals;
+        delete [] jitLogBuffer;
+
+        checkCudaErrors(status);
+    }
+    
     // Locate the kernel entry point
     
     checkCudaErrors(cuModuleGetFunction(phKernel, *phModule, kernelname));
