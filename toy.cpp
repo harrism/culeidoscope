@@ -1320,7 +1320,7 @@ static void HandleTopLevelExpression() {
 /// top ::= definition | external | expression | ';'
 static void MainLoop() {
   while (1) {
-    fprintf(stderr, "ready> ");
+    if (Infile == stdin) fprintf(stderr, "ready> ");
     switch (CurTok) {
     case tok_eof:    return;
     case ';':        getNextToken(); break;  // ignore top-level semicolons.
@@ -1453,8 +1453,13 @@ void Init() {
 
 int main(int argc, char** argv) {
 
-  if (argc > 1)
+  if (argc > 1) {
     Infile = fopen(argv[1], "r");
+    if (!Infile) {
+      fprintf(stderr, "Error opening input file %s\n", argv[1]);
+      exit(-1);
+    }
+  }
 
   InitializeNativeTarget();
   LLVMContext &Context = getGlobalContext();
