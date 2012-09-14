@@ -137,7 +137,7 @@ void PruneUnrelatedFunctionsAndVariables(Module *M, std::string name)
 // Mark this with nvvm annotation as a kernel
 // function. 
 
-void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::string &kernelname) { 
+void CreateNVVMWrapperKernel(Module *M, Function *F, int N, IRBuilder<> &Builder, std::string &kernelname) { 
 
   PruneUnrelatedFunctionsAndVariables(M, F->getName());
 
@@ -152,7 +152,7 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::
   const FunctionType *type = F->getFunctionType(); 
   std::vector<Type*> Params;
 
-  Function *tidF = NULL; 
+  Function *tidF = NULL, *ntidF = NULL, *ctaidF = NULL;
 
   tidF = M->getFunction("llvm.nvvm.read.ptx.sreg.tid.x"); 
   if (tidF==NULL) {
@@ -160,6 +160,22 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::
     Type *tidTy = Type::getInt32Ty(getGlobalContext()); 
     FunctionType *tidFunTy = FunctionType::get(tidTy,false);
     tidF = Function::Create(tidFunTy, Function::ExternalLinkage, "llvm.nvvm.read.ptx.sreg.tid.x", M);
+  }
+
+  ntidF = M->getFunction("llvm.nvvm.read.ptx.sreg.ntid.x"); 
+  if (ntidF==NULL) {
+    // create an extern declaration for llvm-intrinsic
+    Type *ntidTy = Type::getInt32Ty(getGlobalContext()); 
+    FunctionType *ntidFunTy = FunctionType::get(ntidTy,false);
+    ntidF = Function::Create(ntidFunTy, Function::ExternalLinkage, "llvm.nvvm.read.ptx.sreg.ntid.x", M);
+  }
+
+  ctaidF = M->getFunction("llvm.nvvm.read.ptx.sreg.ctaid.x"); 
+  if (ctaidF==NULL) {
+    // create an extern declaration for llvm-intrinsic
+    Type *ctaidTy = Type::getInt32Ty(getGlobalContext()); 
+    FunctionType *ctaidFunTy = FunctionType::get(ctaidTy,false);
+    ctaidF = Function::Create(ctaidFunTy, Function::ExternalLinkage, "llvm.nvvm.read.ptx.sreg.ctaid.x", M);
   }
 
   // For each parameter in the original function
@@ -180,6 +196,29 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::
   // Create a new basic block to start insertion into.
   BasicBlock *BB = BasicBlock::Create(getGlobalContext(), "entry", kerF);
   Builder.SetInsertPoint(BB);
+
+  // Calculate linear index from thread ID, CTA ID, and # threads per CTA
+  std::vector<Value *> ArgsV;
+  Value *tidreg = Builder.CreateCall(tidF, ArgsV, "calltmp");
+  Value *ntidreg = Builder.CreateCall(ntidF, ArgsV, "calltmp");
+  Value *ctaidreg = Builder.CreateCall(ctaidF, ArgsV, "calltmp");
+  Value *idxreg = Builder.CreateMul(ntidreg, ctaidreg, "ntid_x_ctaid");
+  idxreg = Builder.CreateAdd(idxreg, tidreg, "idx");
+
+   // Create code to check if index > size, and if so, return 
+  Value *CondV = Builder.CreateICmpULT(idxreg, 
+                                       ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), N),
+                                       "ifcond");
+        
+  // Create blocks for the then and else cases.  Insert the 'then' block at the
+  // end of the function.
+  BasicBlock *ThenBB = BasicBlock::Create(getGlobalContext(), "then", kerF);
+  BasicBlock *ElseBB = BasicBlock::Create(getGlobalContext(), "else");
+
+  Builder.CreateCondBr(CondV, ThenBB, ElseBB);
+  
+  // Emit then value -- load operands and call F
+  Builder.SetInsertPoint(ThenBB);
   
   // Set names for all arguments.
   unsigned Idx = 0;
@@ -199,15 +238,14 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::
     NamedValues[arg] = Alloca;
   }
 
-  std::vector<Value *> ArgsV;
-  Value *tidreg = Builder.CreateCall(tidF, ArgsV, "calltmp");
   Idx = 0;
   std::vector<Value *> args; 
+
   for (Function::arg_iterator AI = kerF->arg_begin(); AI != kerF->arg_end();
        ++AI, ++Idx) {
     if (Idx < numParams) {
       std::vector<Value *>index;
-      index.push_back(tidreg);
+      index.push_back(idxreg);
       Value *gep = Builder.CreateGEP(AI, index); 
       Value *loadInst = Builder.CreateLoad(gep);
       args.push_back(loadInst);
@@ -215,13 +253,22 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, std::
     else { 
       Value *result = Builder.CreateCall(F, args, "calltmp");
       std::vector<Value *>index;
-      index.push_back(tidreg);
+      index.push_back(idxreg);
       Value *gep = Builder.CreateGEP(AI, index); 
       Value *storeInst = Builder.CreateStore(result, gep);
       break;
     } 
   }
-  Builder.CreateRetVoid(); 
+
+  Builder.CreateBr(ElseBB);
+  // Codegen of 'Then' can change the current block, update ThenBB for the PHI.
+  ThenBB = Builder.GetInsertBlock();
+  
+  // Emit else block.
+  kerF->getBasicBlockList().push_back(ElseBB);
+  Builder.SetInsertPoint(ElseBB);  
+  
+  Builder.CreateRetVoid();
 
   // Add the nvvm annotation that it is a kernel function. 
   LLVMContext &Context = getGlobalContext();

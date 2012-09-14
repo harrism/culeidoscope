@@ -73,7 +73,7 @@ class PrototypeAST;
 class FunctionAST;
 
 // GPU JIT functions
-extern void CreateNVVMWrapperKernel(Module *M, Function *F, IRBuilder<> &Builder, 
+extern void CreateNVVMWrapperKernel(Module *M, Function *F, int N, IRBuilder<> &Builder, 
                                     std::string &kernelname) ; 
 extern char *BitCodeToPtx(llvm::Module *M);
 void LaunchOnGpu(const char *kernel, unsigned funcarity, unsigned N, void **args, 
@@ -926,10 +926,6 @@ vector_map(char *name, DVector *res, DVector *args) {
 
   unsigned arity = CalleeF->arg_size();
 
-  std::string kernel; 
-  CreateNVVMWrapperKernel(M, CalleeF, Builder, kernel); 
-  char *ptxBuff = BitCodeToPtx(M);
-  
   void **argsbuf = (void **) malloc(sizeof(void *)*arity);
   unsigned pos;
   
@@ -943,7 +939,10 @@ vector_map(char *name, DVector *res, DVector *args) {
      fprintf(stderr,"Could not allocate host memory\n" );
      return ;
   } 
-  
+  std::string kernel; 
+  CreateNVVMWrapperKernel(M, CalleeF, res->length, Builder, kernel); 
+  char *ptxBuff = BitCodeToPtx(M);
+ 
   LaunchOnGpu(kernel.c_str(), arity, res->length, argsbuf, res->ptr, ptxBuff);
 } 
 

@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 
+#include <algorithm>
+
 // includes, CUDA
 #include <cuda.h>
 #include <builtin_types.h>
@@ -117,14 +119,14 @@ void LaunchOnGpu(const char *kernel,
                  void *resbuf,
                  const char *ptxBuff) 
 { 
-  const unsigned int nThreads = N;
+  const unsigned int nThreads = std::min<unsigned>(N, 128);
+  const unsigned int nBlocks = (N + nThreads - 1) / nThreads;
   CUcontext    hContext = 0;
   CUdevice     hDevice  = 0;
   CUmodule     hModule  = 0;
   CUfunction   hKernel  = 0;
   CUdeviceptr  d_data   = 0;
   double       *h_data   = 0;
-  unsigned int nBlocks  = 1;
 
   // Initialize the device and get a handle to the kernel
   checkCudaErrors(initCUDA(kernel, &hContext, &hDevice, &hModule, &hKernel, ptxBuff));
@@ -140,6 +142,7 @@ void LaunchOnGpu(const char *kernel,
   }
 
   checkCudaErrors(cuFuncSetBlockShape(hKernel, nThreads, 1, 1));
+
   // Set the kernel parameters
   int paramOffset = 0;
   for (i = 0; i < funcarity; i++) { 
