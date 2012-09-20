@@ -134,45 +134,32 @@ void LaunchOnGpu(const char *kernel,
   // Allocate memory for result vector on the host and device
   h_data = (double *)resbuf;
   unsigned i; 
-  CUdeviceptr *deviceargs = (CUdeviceptr*) malloc(sizeof(CUdeviceptr)*funcarity);
+  CUdeviceptr *deviceargs = (CUdeviceptr*) malloc(sizeof(CUdeviceptr)*(funcarity + 1));
   for (i = 0; i < funcarity; i++) { 
     double *argi = (double *) args[i];
     checkCudaErrors(cuMemAlloc(&deviceargs[i], N*sizeof(double)));
     checkCudaErrors(cuMemcpyHtoD(deviceargs[i], argi, N*sizeof(double)));
   }
-
-  checkCudaErrors(cuFuncSetBlockShape(hKernel, nThreads, 1, 1));
+  checkCudaErrors(cuMemAlloc(&deviceargs[funcarity], N*sizeof(double))); // return value
 
   // Set the kernel parameters
-
-  int paramOffset = 0;
-  checkCudaErrors(cuParamSeti(hKernel, paramOffset, N));
-  paramOffset += sizeof(unsigned int);
-  for (i = 0; i < funcarity; i++) { 
-    checkCudaErrors(cuParamSetv(hKernel, paramOffset, &deviceargs[i], sizeof(deviceargs[i])));
-    paramOffset += sizeof(deviceargs[i]);
+  void** params = new void*[funcarity+2];
+  params[0] = (void*)&N;                // length
+  for (i = 1; i < funcarity + 2; i++) { // input and output pointers
+    params[i] = &deviceargs[i-1];
   }
 
-  checkCudaErrors(cuMemAlloc(&d_data, N*sizeof(double)));
-  // pass the device ptr for result as the last argument. 
-  checkCudaErrors(cuParamSetv(hKernel, paramOffset, &d_data, sizeof(d_data)));
-
-  checkCudaErrors(cuParamSetSize(hKernel, paramOffset+sizeof(d_data)));
-		   
   // Launch the kernel
-  checkCudaErrors(cuLaunchGrid(hKernel, nBlocks, 1));
-
-  checkCudaErrors(cuCtxSynchronize());
-    
+  checkCudaErrors(cuLaunchKernel(hKernel, nBlocks, 1, 1, nThreads, 1, 1, 0, 0, params, 0));
+  	       
   // Copy the result back to the host
-  checkCudaErrors(cuMemcpyDtoH(h_data, d_data, N*sizeof(double)));
+  checkCudaErrors(cuMemcpyDtoH(h_data, deviceargs[funcarity], N*sizeof(double)));
 
   // free the allocated memory for the arguments 
-  for (i = 0; i < funcarity; i++) { 
-    double *argi = (double *) args[i];
+  for (i = 0; i < funcarity+1; i++) { 
     checkCudaErrors(cuMemFree(deviceargs[i]));
   }
-  checkCudaErrors(cuMemFree(d_data));
+  delete [] params;
   checkCudaErrors(cuModuleUnload(hModule));
   checkCudaErrors(cuCtxDestroy(hContext));
 }
