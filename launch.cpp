@@ -144,7 +144,10 @@ void LaunchOnGpu(const char *kernel,
   checkCudaErrors(cuFuncSetBlockShape(hKernel, nThreads, 1, 1));
 
   // Set the kernel parameters
+
   int paramOffset = 0;
+  checkCudaErrors(cuParamSeti(hKernel, paramOffset, N));
+  paramOffset += sizeof(unsigned int);
   for (i = 0; i < funcarity; i++) { 
     checkCudaErrors(cuParamSetv(hKernel, paramOffset, &deviceargs[i], sizeof(deviceargs[i])));
     paramOffset += sizeof(deviceargs[i]);

@@ -117,41 +117,35 @@ void PruneUnrelatedFunctionsAndVariables(Module *M, std::string name)
   }
 }
 
-// To be able to evaluate an expression f() on a GPU, 
-// we create a wrapper function for F and mark it as 
-// a kernel function with nvvm.annotations. 
-// See the NVVM IR Specification document.   The data
-// from host to device need to copied into separate
-// memory, therefore the kernel function takes 
-// pointer arguments.  The return value is written
-// into the memory as well. 
+// To be able to map an expression f() onto a vector on a GPU, we create a wrapper 
+// kernel function for F and mark it as a kernel function with nvvm.annotations. 
+// See the NVVM IR Specification document. The data from host to device need to 
+// copied into device memory, therefore the kernel function takes pointer arguments.  
+// The return value is written into the memory as well. 
 //
-// For f(x, y)
+// For f(double x, double y)
 //
-// kernel_f(*x, *y, *z) { 
-//    t1 = x[tid];
-//    t2 = x[tid];
-//    t3 = f(t1,t2);
-//    z[tid] = t4;
+// kernel_f(int N, double *x, double *y, double *z) { 
+//    tid = blockDim.x * blockIdx.x + threadIdx.x;
+//    if (tid < N) {
+//      t1 = x[tid];
+//      t2 = x[tid];
+//      t3 = f(t1,t2);
+//      z[tid] = t4;
+//    }
 // } 
-// Mark this with nvvm annotation as a kernel
-// function. 
+// Mark this with nvvm annotation as a kernel function. 
 
-void CreateNVVMWrapperKernel(Module *M, Function *F, int N, IRBuilder<> &Builder, std::string &kernelname) { 
+void CreateNVVMMapKernel(Module *M, Function *F, IRBuilder<> &Builder, std::string &kernelname) { 
 
   PruneUnrelatedFunctionsAndVariables(M, F->getName());
 
   std::stringstream ss;
-  ss << F->getName().data();
-  ss << "_kernel";
+  ss << F->getName().data() << "_kernel";
   kernelname = ss.str();
-  if (M->getFunction(kernelname)) {
+  if (M->getFunction(kernelname))
     return;
-  }
   
-  const FunctionType *type = F->getFunctionType(); 
-  std::vector<Type*> Params;
-
   Function *tidF = NULL, *ntidF = NULL, *ctaidF = NULL;
 
   tidF = M->getFunction("llvm.nvvm.read.ptx.sreg.tid.x"); 
@@ -178,19 +172,23 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, int N, IRBuilder<> &Builder
     ctaidF = Function::Create(ctaidFunTy, Function::ExternalLinkage, "llvm.nvvm.read.ptx.sreg.ctaid.x", M);
   }
 
-  // For each parameter in the original function
-  // create a pointer to that param.
+  const FunctionType *type = F->getFunctionType(); 
+  std::vector<Type*> Params;
+  Params.push_back(IntegerType::getInt32Ty(getGlobalContext())); // size parameter first
+
+  // For each parameter in the original function create a pointer to that param.
   unsigned numParams = type->getNumParams();
   for (unsigned i = 0; i < numParams; i++) { 
     Type *param_t = type->getParamType(i); 
     PointerType *p_t = PointerType::get(param_t, 0); 
     Params.push_back(p_t);
   } 
+  
   Type *resultTy = F->getReturnType(); 
   PointerType *p_t = PointerType::get(resultTy, 0); 
-  Params.push_back(p_t);
-  Type *voidTy =  Type::getVoidTy(getGlobalContext());
-  FunctionType *FT = FunctionType::get(voidTy,Params, false);
+  Params.push_back(p_t); // result is last
+
+  FunctionType *FT = FunctionType::get(Type::getVoidTy(getGlobalContext()), Params, false);
   Function *kerF = Function::Create(FT, Function::ExternalLinkage, kernelname, M);
 
   // Create a new basic block to start insertion into.
@@ -204,11 +202,9 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, int N, IRBuilder<> &Builder
   Value *ctaidreg = Builder.CreateCall(ctaidF, ArgsV, "calltmp");
   Value *idxreg = Builder.CreateMul(ntidreg, ctaidreg, "ntid_x_ctaid");
   idxreg = Builder.CreateAdd(idxreg, tidreg, "idx");
-
-   // Create code to check if index > size, and if so, return 
-  Value *CondV = Builder.CreateICmpULT(idxreg, 
-                                       ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), N),
-                                       "ifcond");
+   
+  // Create code to check if index < size, and if not, return 
+  Value *CondV = Builder.CreateICmpULT(idxreg, &(*kerF->arg_begin()), "ifcond");
         
   // Create blocks for the then and else cases.  Insert the 'then' block at the
   // end of the function.
@@ -219,31 +215,34 @@ void CreateNVVMWrapperKernel(Module *M, Function *F, int N, IRBuilder<> &Builder
   
   // Emit then value -- load operands and call F
   Builder.SetInsertPoint(ThenBB);
-  
+
   // Set names for all arguments.
-  unsigned Idx = 0;
-  for (Function::arg_iterator AI = kerF->arg_begin(); AI != kerF->arg_end();
+  unsigned Idx = 0; 
+  for (Function::arg_iterator AI = kerF->arg_begin(); 
+       AI != kerF->arg_end(); 
        ++AI, ++Idx) {
     std::stringstream ss;
-    ss << "arg";
-    ss << Idx;
+    ss << "arg" << Idx;
     std::string arg;
     ss >> arg; 
     AI->setName(arg);
     
-    // Create an alloca for this variable.
-    AllocaInst *Alloca = CreateEntryBlockAlloca(kerF, arg, false);
+    if (Idx > 0) { // no alloca for length parameter
+      // Create an alloca for this variable.
+      AllocaInst *Alloca = CreateEntryBlockAlloca(kerF, arg, false);
 
-    // Add arguments to variable symbol table.
-    NamedValues[arg] = Alloca;
+      // Add arguments to variable symbol table.
+      NamedValues[arg] = Alloca;
+    }
   }
 
-  Idx = 0;
+  Idx = 1;
   std::vector<Value *> args; 
 
-  for (Function::arg_iterator AI = kerF->arg_begin(); AI != kerF->arg_end();
+  for (Function::arg_iterator AI = ++(kerF->arg_begin()); // skip first 
+       AI != kerF->arg_end();
        ++AI, ++Idx) {
-    if (Idx < numParams) {
+    if (Idx < numParams+1) {
       std::vector<Value *>index;
       index.push_back(idxreg);
       Value *gep = Builder.CreateGEP(AI, index); 
@@ -343,6 +342,3 @@ char *BitCodeToPtx(Module *M)
  
 #undef __NVVM_SAFE_CALL
 } // BitCodeToPtx
-
-
-

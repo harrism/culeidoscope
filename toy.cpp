@@ -73,8 +73,8 @@ class PrototypeAST;
 class FunctionAST;
 
 // GPU JIT functions
-extern void CreateNVVMWrapperKernel(Module *M, Function *F, int N, IRBuilder<> &Builder, 
-                                    std::string &kernelname) ; 
+extern void CreateNVVMMapKernel(Module *M, Function *F, IRBuilder<> &Builder, 
+                                std::string &kernelname) ; 
 extern char *BitCodeToPtx(llvm::Module *M);
 void LaunchOnGpu(const char *kernel, unsigned funcarity, unsigned N, void **args, 
                  void *resbuf, const char *filename);
@@ -940,7 +940,7 @@ vector_map(char *name, DVector *res, DVector *args) {
      return ;
   } 
   std::string kernel; 
-  CreateNVVMWrapperKernel(M, CalleeF, res->length, Builder, kernel); 
+  CreateNVVMMapKernel(M, CalleeF, Builder, kernel); 
   char *ptxBuff = BitCodeToPtx(M);
  
   LaunchOnGpu(kernel.c_str(), arity, res->length, argsbuf, res->ptr, ptxBuff);
@@ -1001,9 +1001,7 @@ Value *IfExprAST::Codegen() {
 // MJH Note: the semantics of for loops are changed here relative to the 
 // original Kaleidoscope example because in the original, for loops ran
 // for one extra iteration compared to loops in other languages like C. See
-// [LLVM bug 13266][1]
-//
-// [1]: http://llvm.org/bugs/show_bug.cgi?id=13266
+// [LLVM bug 13266](http://llvm.org/bugs/show_bug.cgi?id=13266)
 Value *ForExprAST::Codegen() {
   // Output this as:
   //   var = alloca double
